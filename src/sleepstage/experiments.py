@@ -172,3 +172,130 @@ def resampling_counts(ctx: DataContext) -> dict:
         _, y_resampled = resample(X_train, y_train, strategy)
         counts[strategy] = {str(cls): int(n) for cls, n in Counter(y_resampled).items()}
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Running the grid and saving artifacts
+# ---------------------------------------------------------------------------
+def _json_default(value):
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Not JSON serialisable: {type(value)}")
+
+
+def pca_decision(results: list[dict]) -> list[dict]:
+    """Compare Random Forest with and without PCA on blocked-split CV scores."""
+    decisions = []
+    for trimming in config.TRIM_OPTIONS:
+        for class_setup in config.CLASS_SETUPS:
+            scores = {}
+            for model in ("random_forest", "random_forest_pca"):
+                key = "|".join(("blocked", trimming, class_setup, config.DEFAULT_RESAMPLING, model))
+                match = next((r for r in results if r["key"] == key), None)
+                if match:
+                    scores[model] = match["cv_f1_mean"]
+            if len(scores) == 2:
+                decisions.append(
+                    {
+                        "trimming": trimming,
+                        "class_setup": class_setup,
+                        "cv_f1_without_pca": scores["random_forest"],
+                        "cv_f1_with_pca": scores["random_forest_pca"],
+                        "choice": max(scores, key=scores.get),
+                    }
+                )
+    return decisions
+
+
+def run_all(
+    output_dir: str | Path = config.ARTIFACTS_DIR,
+    data_path: str | Path | None = None,
+    quick: bool = False,
+    tune: bool = True,
+    save_all_models: bool = False,
+    progress=None,
+) -> dict:
+    """Run every experiment and write metrics, predictions, CV folds, importances and models."""
+    output_dir = Path(output_dir)
+    models_dir = output_dir / MODELS_DIR
+    models_dir.mkdir(parents=True, exist_ok=True)
+    tune = tune and not quick
+
+    df = load_dataset(data_path)
+    specs = build_experiment_specs(quick)
+    results, prediction_frames, importances, counts_by_context = [], [], {}, {}
+    contexts: dict[str, DataContext] = {}
+    default_params: dict[str, dict] = {}
+
+    for index, spec in enumerate(specs, start=1):
+        if spec.context_key not in contexts:
+            contexts[spec.context_key] = prepare_context(df, spec.split_type, spec.trimming, spec.class_setup)
+            counts_by_context[spec.context_key] = resampling_counts(contexts[spec.context_key])
+        ctx = contexts[spec.context_key]
+
+        # Other resampling strategies reuse the params tuned with the default strategy.
+        fixed = None
+        if not is_baseline(spec.model) and spec.resampling != config.DEFAULT_RESAMPLING:
+            fixed = default_params.get(f"{spec.context_key}|{spec.model}")
+
+        logger.info("[%d/%d] %s", index, len(specs), spec.key)
+        if progress is not None:
+            progress(index, len(specs), spec.key)
+        result, fitted, predictions = run_experiment(spec, ctx, tune=tune, fixed_params=fixed)
+        results.append(result)
+        prediction_frames.append(predictions)
+
+        is_default = is_baseline(spec.model) or spec.resampling == config.DEFAULT_RESAMPLING
+        if not is_baseline(spec.model) and spec.resampling == config.DEFAULT_RESAMPLING:
+            default_params[f"{spec.context_key}|{spec.model}"] = result["best_params"]
+
+        if is_default and not is_baseline(spec.model):
+            X_test, y_test = ctx.X[ctx.split.test_idx], ctx.y[ctx.split.test_idx]
+            importances[spec.key] = {
+                "impurity": impurity_importance(fitted, config.FEATURE_COLUMNS),
+                "permutation": permutation_importance_scores(fitted, X_test, y_test, config.FEATURE_COLUMNS),
+            }
+        if is_default or save_all_models:
+            joblib.dump(fitted, models_dir / model_filename(spec.key), compress=3)
+
+    stage_counts = to_stage_codes(df[config.LABEL_COLUMN]).value_counts()
+    metrics = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "quick_run": quick,
+        "tuned": tune,
+        "config": {
+            "random_state": config.RANDOM_STATE,
+            "test_size": config.TEST_SIZE,
+            "cv_folds": config.CV_FOLDS,
+            "n_blocks": config.N_BLOCKS,
+            "n_test_blocks": config.N_TEST_BLOCKS,
+            "block_embargo_epochs": config.BLOCK_EMBARGO_EPOCHS,
+            "wake_trim_margin_epochs": config.WAKE_TRIM_MARGIN_EPOCHS,
+            "default_resampling": config.DEFAULT_RESAMPLING,
+            "pca_components": config.PCA_COMPONENTS,
+        },
+        "dataset": {
+            "path": str(data_path or config.DATA_PATH),
+            "n_epochs": int(len(df)),
+            "stage_counts": {stage: int(n) for stage, n in stage_counts.items()},
+        },
+        "pca_decision": pca_decision(results),
+        "resampling_counts": counts_by_context,
+        "experiments": results,
+    }
+
+    (output_dir / METRICS_FILE).write_text(json.dumps(metrics, indent=2, default=_json_default), encoding="utf-8")
+    (output_dir / IMPORTANCE_FILE).write_text(json.dumps(importances, indent=2, default=_json_default), encoding="utf-8")
+    pd.concat(prediction_frames, ignore_index=True).to_csv(output_dir / PREDICTIONS_FILE, index=False)
+    folds = [
+        {"key": r["key"], "fold": fold, "f1_macro": score}
+        for r in results
+        for fold, score in enumerate(r["cv_fold_scores"])
+    ]
+    pd.DataFrame(folds).to_csv(output_dir / CV_FOLDS_FILE, index=False)
+    logger.info("Wrote %d experiments to %s", len(results), output_dir)
+    return metrics
