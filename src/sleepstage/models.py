@@ -62,3 +62,54 @@ def resample(X, y, strategy: str, random_state: int = config.RANDOM_STATE, k_nei
 
 def make_sampler(strategy: str, random_state: int = config.RANDOM_STATE) -> FunctionSampler:
     return FunctionSampler(func=resample, kw_args={"strategy": strategy, "random_state": random_state})
+
+
+# ---------------------------------------------------------------------------
+# Models, pipelines and hyperparameter grids
+# ---------------------------------------------------------------------------
+def is_baseline(model: str) -> bool:
+    return model in config.BASELINE_MODELS
+
+
+def build_classifier(model: str, random_state: int = config.RANDOM_STATE):
+    if model == "dummy_most_frequent":
+        return DummyClassifier(strategy="most_frequent")
+    if model == "dummy_stratified":
+        return DummyClassifier(strategy="stratified", random_state=random_state)
+    if model in ("random_forest", "random_forest_pca"):
+        return RandomForestClassifier(
+            n_estimators=config.RF_N_ESTIMATORS, class_weight="balanced", n_jobs=-1, random_state=random_state
+        )
+    if model == "hist_gradient_boosting":
+        return HistGradientBoostingClassifier(class_weight="balanced", early_stopping=False, random_state=random_state)
+    if model == "logistic_regression":
+        return LogisticRegression(class_weight="balanced", max_iter=2000)
+    raise ValueError(f"Unknown model: {model!r}")
+
+
+def build_pipeline(model: str, resampling: str = "none", random_state: int = config.RANDOM_STATE) -> ImbPipeline:
+    """Resampling (train-only) -> optional scaling/PCA -> classifier, as one pipeline."""
+    if is_baseline(model) and resampling != "none":
+        raise ValueError("Baselines are evaluated without resampling")
+    steps = []
+    if resampling != "none":
+        steps.append(("resample", make_sampler(resampling, random_state)))
+    if model == "logistic_regression":
+        steps.append(("scale", StandardScaler()))
+    if model == "random_forest_pca":
+        steps.append(("pca", PCA(n_components=config.PCA_COMPONENTS, random_state=random_state)))
+    steps.append(("clf", build_classifier(model, random_state)))
+    return ImbPipeline(steps)
+
+
+PARAM_GRIDS = {
+    "random_forest": {"clf__max_depth": [None, 12], "clf__min_samples_leaf": [1, 4]},
+    "random_forest_pca": {"clf__max_depth": [None, 12], "clf__min_samples_leaf": [1, 4]},
+    "hist_gradient_boosting": {"clf__learning_rate": [0.05, 0.1], "clf__max_leaf_nodes": [15, 31]},
+    "logistic_regression": {"clf__C": [0.1, 1.0, 10.0]},
+}
+
+
+def param_grid_for(model: str) -> dict:
+    """Small search grid for a model; empty for baselines."""
+    return PARAM_GRIDS.get(model, {})
