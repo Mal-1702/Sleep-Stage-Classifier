@@ -112,3 +112,32 @@ def fit_and_cross_validate(pipeline, param_grid: dict, X_train, y_train, cv, gro
     )
     fitted = clone(pipeline).fit(X_train, y_train)
     return fitted, {}, [float(score) for score in results["test_score"]]
+
+
+# ---------------------------------------------------------------------------
+# Feature importance
+# ---------------------------------------------------------------------------
+def impurity_importance(pipeline, feature_names: list[str]) -> dict | None:
+    """Tree impurity importance per input feature; None when the model has none or uses PCA."""
+    if "pca" in pipeline.named_steps:
+        return None
+    classifier = pipeline.named_steps["clf"]
+    if not hasattr(classifier, "feature_importances_"):
+        return None
+    return {name: float(value) for name, value in zip(feature_names, classifier.feature_importances_)}
+
+
+def permutation_importance_scores(pipeline, X_test, y_test, feature_names: list[str], random_state: int = config.RANDOM_STATE) -> dict:
+    """Drop in test macro-F1 when each feature is shuffled."""
+    result = permutation_importance(
+        pipeline,
+        X_test,
+        y_test,
+        scoring=MACRO_F1_SCORER,
+        n_repeats=config.PERMUTATION_REPEATS,
+        random_state=random_state,
+    )
+    return {
+        name: {"mean": float(result.importances_mean[i]), "std": float(result.importances_std[i])}
+        for i, name in enumerate(feature_names)
+    }
