@@ -56,3 +56,35 @@ def load_dataset(path: str | Path | None = None) -> pd.DataFrame:
     df["epoch"] = np.arange(len(df))
     logger.info("Loaded %d epochs with %d features from %s", len(df), len(config.FEATURE_COLUMNS), path)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Label mapping and N3 merging
+# ---------------------------------------------------------------------------
+def to_stage_codes(raw_labels: pd.Series) -> pd.Series:
+    """Map raw CSV labels ('Sleep stage W', ...) to stage codes ('W', ...)."""
+    stages = raw_labels.map(config.RAW_LABEL_MAP)
+    if stages.isna().any():
+        unknown = sorted(raw_labels[stages.isna()].unique())
+        raise DataValidationError(f"Unknown labels (not in RAW_LABEL_MAP): {unknown}")
+    return stages
+
+
+def apply_class_setup(stages: pd.Series, class_setup: str) -> pd.Series:
+    """Return stage codes for a class setup: '6class' keeps S3/S4, '5class' merges them into N3."""
+    if class_setup == "6class":
+        return stages.copy()
+    if class_setup == "5class":
+        return stages.replace(config.N3_MERGE_MAP)
+    raise ValueError(f"Unknown class setup: {class_setup!r}")
+
+
+def labels_for_setup(class_setup: str) -> list[str]:
+    if class_setup not in config.CLASS_SETUPS:
+        raise ValueError(f"Unknown class setup: {class_setup!r}")
+    return list(config.CLASS_SETUPS[class_setup])
+
+
+def six_to_five(labels) -> np.ndarray:
+    """Map 6-class labels to 5-class (S3/S4 -> N3), so 6-class models can be scored like 5-class ones."""
+    return np.array([config.N3_MERGE_MAP.get(label, label) for label in labels], dtype=object)
