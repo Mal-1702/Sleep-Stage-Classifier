@@ -174,3 +174,96 @@ The original `sleep_stage_classifier.py`, `chart_1.py` and `demo.py` are kept un
 | Confusion matrix plot retrained the model | Dashboard reads saved predictions |
 | Random epoch split only (leaky), no baselines, no kappa | Blocked split, baselines, kappa, balanced accuracy, per-class scores |
 | PCA(6) used without justification | Compared with no PCA on blocked-split CV |
+
+## Results
+
+All numbers come from `artifacts/metrics.json` (full run with tuning, seed 42), scored on held-out test
+epochs. κ is Cohen's kappa. The default resampling is SMOTE; baselines use none.
+
+### Random vs blocked split (5 classes, full recording)
+
+| Model | Random: Acc | Random: Macro F1 | Random: κ | Blocked: Acc | Blocked: Macro F1 | Blocked: κ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline: always most frequent | 0.663 | 0.159 | 0.000 | 0.506 | 0.134 | 0.000 |
+| Baseline: random by class frequency | 0.480 | 0.210 | 0.020 | 0.389 | 0.159 | -0.048 |
+| Random Forest | 0.934 | 0.825 | 0.874 | 0.772 | 0.580 | 0.651 |
+| Random Forest + PCA(6) | 0.902 | 0.745 | 0.814 | 0.763 | 0.526 | 0.632 |
+| Hist Gradient Boosting | 0.943 | 0.839 | 0.890 | 0.868 | 0.699 | 0.788 |
+| Logistic Regression | 0.911 | 0.765 | 0.831 | 0.848 | 0.615 | 0.763 |
+
+Test sets: 561 epochs each. The blocked test set is blocks 0 and 5 of 10.
+
+### Random vs blocked split (5 classes, wake trimmed to ±30 min)
+
+| Model | Random: Acc | Random: Macro F1 | Random: κ | Blocked: Acc | Blocked: Macro F1 | Blocked: κ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline: always most frequent | 0.511 | 0.135 | 0.000 | 0.623 | 0.154 | 0.000 |
+| Baseline: random by class frequency | 0.326 | 0.219 | 0.011 | 0.350 | 0.190 | 0.028 |
+| Random Forest | 0.828 | 0.783 | 0.747 | 0.500 | 0.357 | 0.288 |
+| Random Forest + PCA(6) | 0.814 | 0.767 | 0.727 | 0.532 | 0.350 | 0.301 |
+| Hist Gradient Boosting | 0.828 | 0.785 | 0.746 | 0.791 | 0.614 | 0.598 |
+| Logistic Regression | 0.778 | 0.741 | 0.685 | 0.764 | 0.588 | 0.569 |
+
+Test sets: 221 (random) and 220 (blocked, blocks 5 and 6) epochs.
+
+### Resampling strategies (Random Forest, 5 classes, blocked split)
+
+| Resampling | Full recording: CV Macro F1 | Full: Test Macro F1 | Full: Test κ | Trimmed: CV Macro F1 | Trimmed: Test Macro F1 | Trimmed: Test κ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| None (class weights only) | 0.704 ± 0.248 | 0.465 | 0.635 | 0.527 ± 0.150 | 0.356 | 0.283 |
+| SMOTE | 0.721 ± 0.242 | 0.580 | 0.651 | 0.543 ± 0.174 | 0.357 | 0.288 |
+| Borderline-SMOTE | 0.702 ± 0.255 | 0.574 | 0.657 | 0.547 ± 0.164 | 0.490 | 0.525 |
+| ADASYN | 0.716 ± 0.248 | 0.547 | 0.627 | 0.555 ± 0.151 | 0.475 | 0.520 |
+| Selective SMOTE | 0.721 ± 0.242 | 0.580 | 0.651 | 0.543 ± 0.174 | 0.357 | 0.288 |
+
+### Does PCA(6) help? (blocked-split CV Macro F1)
+
+| Wake | Classes | Without PCA | With PCA(6) | Decision |
+| --- | --- | ---: | ---: | --- |
+| Full recording | 5 | 0.721 | 0.689 | No PCA |
+| Full recording | 6 | 0.679 | 0.639 | No PCA |
+| Trimmed | 5 | 0.543 | 0.491 | No PCA |
+| Trimmed | 6 | 0.518 | 0.438 | No PCA |
+
+### Key findings
+
+1. **The original evaluation was inflated by leakage.** The same tuned Random Forest scores κ 0.874 with a
+   random epoch split but 0.651 when whole blocks of time are held out (full recording), and 0.747 vs 0.288
+   on the trimmed recording. Under the random split, CV and test agree within 0.02; under the blocked split
+   the gap grows to 0.14–0.19.
+2. **Every model beats both baselines by a wide margin**, on every split. Always predicting the most
+   frequent stage gets 51–66% accuracy but κ 0 and macro F1 ≈ 0.15.
+3. **Under the honest split, the simpler and smoother models generalise better than Random Forest.**
+   Hist Gradient Boosting reaches κ 0.788 / macro F1 0.699 (full recording) and κ 0.598 (trimmed);
+   Logistic Regression reaches κ 0.763 and 0.569. The Random Forest falls to κ 0.288 on the trimmed
+   recording, where it misses every deep-sleep test epoch. Choosing a model by blocked-split CV alone
+   would pick Logistic Regression (CV Macro F1 0.784, test κ 0.763), which is the fair headline number.
+4. **Trimming wake makes the task harder, not easier.** Most of the full recording's wake is easy to
+   recognise; without it, the model has to separate N1, N2, N3 and REM, which is the clinically hard part.
+5. **Resampling helps rare stages a little, and the differences are within noise.** SMOTE lifts the Random
+   Forest's test macro F1 from 0.465 to 0.580 on the full recording, and Borderline-SMOTE/ADASYN lift it
+   from 0.357 to about 0.48 on the trimmed recording. But blocked CV scores vary by ±0.15–0.25 between
+   folds. Selective SMOTE equals SMOTE here, because no stage has between 2 and 15 training epochs.
+6. **PCA(6) hurts** in all four blocked-CV comparisons, so the final models use all 13 features.
+7. **Keeping stages 3 and 4 separate costs little.** The 6-class Random Forest, scored after merging into
+   N3, performs like the 5-class model (κ 0.633 vs 0.651 full recording; 0.301 vs 0.288 trimmed).
+
+## Limitations
+
+- **One recording, no subject id.** All epochs come from a single night, so these results say nothing
+  about a new person. The blocked split tests on unseen *time*, not unseen *people*. Real subject-wise
+  evaluation needs features re-extracted from raw Sleep-EDF with a subject id; the plan is in
+  `src/sleepstage/extract_features.py`.
+- **Pre-scaled features.** The CSV was standardised over the whole file before any split, which leaks a
+  little test information into training. It can't be undone without the raw signals.
+- **Tiny classes, small test sets.** Stage 4 has 9 epochs in total. The full-recording blocked test set has
+  only 3 deep-sleep epochs, so its N3 score is not meaningful; the trimmed blocked test set has 21.
+- **Uneven blocked CV folds.** Several blocks are almost pure wake, so per-fold scores vary widely, and
+  tuned CV scores are slightly optimistic (they come from the winning grid point).
+- **Single public dataset** (Sleep-EDF format): one EEG montage, one scorer.
+- **The sleep-insights page is a rule-based illustration.** It is not trained, not validated against any
+  outcome, and not medical advice.
+- **Comparison with published work.** Deep models trained on raw EEG from many subjects, such as
+  DeepSleepNet (Supratak et al., 2017) and U-Time (Perslev et al., 2019), report roughly 80–85% accuracy
+  and macro F1 around 0.75–0.80 on Sleep-EDF with subject-wise evaluation. Those results are not directly
+  comparable with this project, which tests on unseen parts of one night.
