@@ -107,3 +107,68 @@ def prepare_context(df: pd.DataFrame, split_type: str, trimming: str, class_setu
     frame = frame.reset_index(drop=True)
     split = make_split(split_type, frame["stage_6class"].to_numpy())
     return DataContext(frame, frame[config.FEATURE_COLUMNS].to_numpy(), frame["stage"].to_numpy(dtype=object), split)
+
+
+# ---------------------------------------------------------------------------
+# Running one experiment
+# ---------------------------------------------------------------------------
+def run_experiment(spec: ExperimentSpec, ctx: DataContext, tune: bool = True, fixed_params: dict | None = None):
+    """Fit, cross-validate and test one experiment. Returns (result, fitted_pipeline, predictions)."""
+    split = ctx.split
+    X_train, y_train = ctx.X[split.train_idx], ctx.y[split.train_idx]
+    X_test, y_test = ctx.X[split.test_idx], ctx.y[split.test_idx]
+    labels = labels_for_setup(spec.class_setup)
+
+    pipeline = build_pipeline(spec.model, spec.resampling)
+    param_grid = param_grid_for(spec.model) if tune else {}
+    if fixed_params:
+        pipeline.set_params(**fixed_params)
+        param_grid = {}
+
+    fitted, best_params, fold_scores = fit_and_cross_validate(
+        pipeline, param_grid, X_train, y_train, split.cv, groups=split.groups
+    )
+    y_pred = fitted.predict(X_test)
+    metrics = compute_metrics(y_test, y_pred, labels)
+    if spec.class_setup == "6class":
+        metrics["five_class_equivalent"] = five_class_equivalent(y_test, y_pred)
+
+    cv_mean = float(np.mean(fold_scores))
+    result = {
+        **asdict(spec),
+        "key": spec.key,
+        "best_params": {name: value for name, value in (fixed_params or best_params).items()},
+        "tuned": bool(param_grid),
+        "cv_fold_scores": fold_scores,
+        "cv_f1_mean": cv_mean,
+        "cv_f1_std": float(np.std(fold_scores)),
+        "cv_test_gap": abs(cv_mean - metrics["f1_macro"]),
+        "test": metrics,
+        "n_train": int(len(y_train)),
+        "n_test": int(len(y_test)),
+        "train_class_counts": dict(Counter(y_train)),
+        "test_blocks": split.test_blocks,
+    }
+
+    predictions = pd.DataFrame(
+        {
+            "key": spec.key,
+            "epoch": ctx.frame["epoch"].to_numpy()[split.test_idx],
+            "y_true": y_test,
+            "y_pred": y_pred,
+        }
+    )
+    probabilities = fitted.predict_proba(X_test)
+    for i, cls in enumerate(fitted.classes_):
+        predictions[f"prob_{cls}"] = probabilities[:, i]
+    return result, fitted, predictions
+
+
+def resampling_counts(ctx: DataContext) -> dict:
+    """Training-set class counts before and after each resampling strategy."""
+    X_train, y_train = ctx.X[ctx.split.train_idx], ctx.y[ctx.split.train_idx]
+    counts = {}
+    for strategy in config.RESAMPLING_STRATEGIES:
+        _, y_resampled = resample(X_train, y_train, strategy)
+        counts[strategy] = {str(cls): int(n) for cls, n in Counter(y_resampled).items()}
+    return counts
