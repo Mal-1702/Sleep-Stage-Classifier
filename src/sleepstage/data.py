@@ -88,3 +88,26 @@ def labels_for_setup(class_setup: str) -> list[str]:
 def six_to_five(labels) -> np.ndarray:
     """Map 6-class labels to 5-class (S3/S4 -> N3), so 6-class models can be scored like 5-class ones."""
     return np.array([config.N3_MERGE_MAP.get(label, label) for label in labels], dtype=object)
+
+
+# ---------------------------------------------------------------------------
+# Wake trimming
+# ---------------------------------------------------------------------------
+def trim_wake(
+    df: pd.DataFrame,
+    stage_column: str = "stage",
+    margin: int = config.WAKE_TRIM_MARGIN_EPOCHS,
+) -> pd.DataFrame:
+    """Drop the long wake periods before sleep onset and after the final awakening.
+
+    Keeps `margin` epochs of wake on each side of the sleep period. Assumes rows are
+    in temporal order and come from one recording.
+    """
+    is_sleep = (df[stage_column] != config.WAKE_LABEL).to_numpy()
+    if not is_sleep.any():
+        logger.warning("No sleep epochs found; wake trimming skipped")
+        return df.copy()
+    sleep_positions = np.flatnonzero(is_sleep)
+    start = max(0, sleep_positions[0] - margin)
+    stop = min(len(df), sleep_positions[-1] + margin + 1)
+    return df.iloc[start:stop].copy()
