@@ -1,0 +1,14 @@
+# Core
+numpy==2.2.1
+pandas==2.2.3
+scikit-learn==1.7.1
+imbalanced-learn==0.14.0
+scipy==1.16.1
+joblib==1.5.1
+
+# Dashboard
+streamlit==1.47.1
+plotly==6.3.0
+
+# Tests
+pytest==9.0.3
