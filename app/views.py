@@ -383,3 +383,192 @@ def render_feature_importance(state: PageState) -> None:
         "Near-zero permutation importance can mean a feature is useless, or that a correlated feature "
         "(e.g. another band power) carries the same information."
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. Hypnogram
+# ---------------------------------------------------------------------------
+def render_hypnogram(state: PageState) -> None:
+    st.title("Hypnogram: true vs predicted")
+    result = _require_result(state)
+    if result is None:
+        return
+    st.caption(_describe(state.selection))
+    predictions = state.artifacts.predictions_for(result["key"])
+    contiguous = state.selection["split_type"] == "blocked"
+    if not contiguous:
+        st.info("With a random split the test epochs are scattered across the night, so they're drawn as points. Switch to the blocked split for continuous stretches.")
+    elif result.get("test_blocks") is not None:
+        st.caption(f"Test blocks {result['test_blocks']} of {state.artifacts.metrics['config']['n_blocks']}.")
+    show(charts.hypnogram_comparison(predictions, contiguous))
+
+    wrong = predictions[predictions["y_true"] != predictions["y_pred"]]
+    st.metric("Misclassified test epochs", f"{len(wrong)} of {len(predictions)}", help="Each epoch is 30 seconds")
+    if not wrong.empty:
+        confusions = wrong.groupby(["y_true", "y_pred"]).size().reset_index(name="epochs").sort_values("epochs", ascending=False)
+        st.subheader("Most common mistakes")
+        st.dataframe(confusions.rename(columns={"y_true": "True stage", "y_pred": "Predicted as"}), hide_index=True, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# 9. Predict
+# ---------------------------------------------------------------------------
+def _prediction_model(state: PageState):
+    """The selected model if it was saved, otherwise this context's default Random Forest."""
+    candidates = [state.selection, state.with_changes(model=config.PRIMARY_MODEL, resampling=config.DEFAULT_RESAMPLING)]
+    for selection in candidates:
+        result = state.artifacts.find(**selection)
+        if result and state.artifacts.model_path(result["key"]):
+            return selection, state.artifacts.load_model(result["key"])
+    return None, None
+
+
+def render_predict(state: PageState) -> None:
+    st.title("Predict sleep stages")
+    if state.artifacts is None:
+        _require_result(state)
+        return
+    selection, model = _prediction_model(state)
+    if model is None:
+        st.warning("No saved model for this context. Run `python scripts/train.py`.")
+        return
+    if selection != state.selection:
+        st.info("The selected combination has no saved model, so the default Random Forest for this context is used.")
+    st.caption(f"Model: {_describe(selection)}")
+
+    st.markdown(
+        f"Upload a CSV with these {len(config.FEATURE_COLUMNS)} columns, one row per 30-second epoch in time order, "
+        "standardised the same way as the training data. A `label` column is optional and enables scoring."
+    )
+    st.code(", ".join(config.FEATURE_COLUMNS), language=None)
+    if state.data_path.exists():
+        # Held-out test epochs only: a sample the model trained on would show an inflated score.
+        test_epochs = state.artifacts.predictions_for(state.artifacts.find(**selection)["key"])["epoch"].head(120)
+        full = dataset_view(state.data_path, "untrimmed", "6class")
+        template = full[full["epoch"].isin(test_epochs)][config.FEATURE_COLUMNS + [config.LABEL_COLUMN]]
+        st.download_button(
+            f"Download a sample CSV ({len(template)} held-out test epochs)",
+            template.to_csv(index=False),
+            "sample_epochs.csv",
+            "text/csv",
+        )
+
+    uploaded = st.file_uploader("Feature CSV", type="csv")
+    if uploaded is None:
+        return
+    try:
+        frame = pd.read_csv(uploaded)
+        validate_features(frame, require_label=False)
+    except (DataValidationError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        st.error(f"Can't use this file: {exc}")
+        return
+
+    X = frame[config.FEATURE_COLUMNS].to_numpy()
+    predicted = model.predict(X)
+    probabilities = pd.DataFrame(model.predict_proba(X), columns=[f"P({cls})" for cls in model.classes_])
+    output = pd.concat([pd.DataFrame({"epoch": np.arange(len(frame)), "predicted_stage": predicted}), probabilities], axis=1)
+
+    if config.LABEL_COLUMN in frame:
+        try:
+            truth = apply_class_setup(to_stage_codes(frame[config.LABEL_COLUMN]), selection["class_setup"]).to_numpy()
+        except DataValidationError as exc:
+            st.warning(f"Ignoring the label column: {exc}")
+        else:
+            output.insert(2, "true_stage", truth)
+            st.metric("Accuracy on your labelled file", f"{np.mean(truth == predicted):.1%}")
+
+    left, right = st.columns([3, 2])
+    with left:
+        show(charts.hypnogram(output["epoch"], output["predicted_stage"], title="Predicted hypnogram"))
+    with right:
+        shares = output["predicted_stage"].value_counts(normalize=True).to_dict()
+        show(charts.stage_shares(shares))
+    st.dataframe(output, hide_index=True, use_container_width=True)
+    st.download_button("Download predictions", output.to_csv(index=False), "predictions.csv", "text/csv")
+
+
+# ---------------------------------------------------------------------------
+# 10. Sleep insights (demo)
+# ---------------------------------------------------------------------------
+def render_insights(state: PageState) -> None:
+    st.title("Sleep insights (demo)")
+    st.warning(f"**{config.DISCLAIMER}**")
+    st.markdown(
+        "This page summarises a **sequence** of stages with standard descriptive measures (sleep efficiency, "
+        "awakenings, stage shares) and applies hand-picked thresholds. It replaces the old “good day / bad day” "
+        "feature, which judged a whole day from a single 30-second epoch."
+    )
+
+    sources = ["True labels for the recording"]
+    if state.artifacts is not None and state.result is not None:
+        sources.append("Model predictions on the test set")
+    source = st.radio("Stage sequence", sources, horizontal=True)
+
+    if source == sources[0]:
+        frame = _dataset(state)
+        if frame is None:
+            return
+        stages = frame["stage"].tolist()
+        st.caption(f"{len(stages):,} epochs, {state.selection['trimming']}. Untrimmed recordings include hours of wake, which lowers sleep efficiency.")
+    else:
+        predictions = state.artifacts.predictions_for(state.result["key"])
+        stages = predictions["y_pred"].tolist()
+        if state.selection["split_type"] == "random":
+            st.info("Random-split test epochs are scattered through the night, so sequence measures like awakenings are not meaningful here. Use the blocked split.")
+        st.caption(f"{len(stages):,} predicted test epochs · {_describe(state.selection)}")
+
+    insight = sleep_insights_demo(stages)
+    summary = insight["summary"]
+    st.subheader(f"{insight['category']} (illustrative score {insight['score']})")
+    for note in insight["notes"]:
+        st.markdown(f"- {note}")
+
+    cols = st.columns(4)
+    cols[0].metric("Sleep efficiency", f"{summary['sleep_efficiency']:.0%}")
+    cols[1].metric("Total sleep", f"{summary['total_sleep_min'] / 60:.1f} h")
+    cols[2].metric("Awakenings", summary["awakenings"])
+    latency = summary["sleep_onset_latency_min"]
+    cols[3].metric("Sleep onset latency", "n/a" if latency is None else f"{latency:.0f} min")
+    cols = st.columns(3)
+    cols[0].metric("Wake after sleep onset", f"{summary['wake_after_sleep_onset_min']:.0f} min")
+    cols[1].metric("Stage transitions", summary["stage_transitions"])
+    cols[2].metric("Longest N3 run", f"{summary['longest_n3_run_min']:.1f} min")
+    show(charts.stage_shares(summary["stage_share"]))
+
+
+# ---------------------------------------------------------------------------
+# 11. Limitations
+# ---------------------------------------------------------------------------
+def render_limitations(state: PageState) -> None:
+    st.title("Limitations")
+    st.markdown(
+        """
+**Data**
+- **One recording, no subject id.** Every epoch comes from a single night, so nothing here shows the model
+  works on a different person. The blocked split is the best available substitute; real subject-wise
+  evaluation needs features re-extracted from raw Sleep-EDF with a subject id
+  (plan in `src/sleepstage/extract_features.py`).
+- **Pre-scaled features.** The CSV was standardised over the whole file before any split, which leaks a
+  little information from test to training. It can't be undone without the raw signals.
+- **Tiny classes.** Stage 4 has 9 epochs and Stage 3 has 96, so their per-class scores rest on very few
+  test epochs. The blocked test set for the untrimmed recording holds only a handful of deep-sleep epochs.
+- **Single public dataset.** Features and labels come from one source (Sleep-EDF format), one EEG montage,
+  one scorer.
+
+**Method**
+- Hyperparameters were tuned with cross-validation on training rows only, but reported CV scores come from
+  the winning grid point and are slightly optimistic. The held-out test score is the one to trust.
+- Blocked CV folds are uneven: some training blocks are almost pure wake.
+- Resampling creates synthetic epochs by interpolation; it can't add real information about rare stages.
+
+**The sleep-insights page**
+- Rule-based illustration only. It is not trained, not validated against any outcome, and not medical advice.
+
+**How this compares with published work**
+- Deep models trained on raw EEG from many subjects, such as **DeepSleepNet** (Supratak et al., 2017) and
+  **U-Time** (Perslev et al., 2019), report roughly 80–85% accuracy and macro F1 around 0.75–0.80 on
+  Sleep-EDF under **subject-wise** evaluation.
+- Those numbers are not directly comparable with this project: they test on unseen people, while this
+  project tests on unseen parts of one night. A fair comparison needs the subject-wise pipeline above.
+"""
+    )
