@@ -88,3 +88,27 @@ def compute_metrics(y_true, y_pred, labels: list[str]) -> dict:
 def five_class_equivalent(y_true, y_pred) -> dict:
     """Score 6-class predictions after merging S3/S4 into N3, so they compare with 5-class models."""
     return compute_metrics(six_to_five(y_true), six_to_five(y_pred), config.FIVE_CLASS_LABELS)
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation and tuning
+# ---------------------------------------------------------------------------
+def fit_and_cross_validate(pipeline, param_grid: dict, X_train, y_train, cv, groups=None):
+    """Tune (if a grid is given) and cross-validate on the training rows only, then refit.
+
+    Returns (fitted_pipeline, best_params, cv_fold_scores). With a grid, fold scores are
+    those of the winning parameters, so they are slightly optimistic; the held-out test
+    set is never used for tuning.
+    """
+    if param_grid:
+        search = GridSearchCV(pipeline, param_grid, scoring=MACRO_F1_SCORER, cv=cv, refit=True, error_score="raise")
+        search.fit(X_train, y_train, groups=groups)
+        best = search.best_index_
+        fold_scores = [float(search.cv_results_[f"split{i}_test_score"][best]) for i in range(search.n_splits_)]
+        return search.best_estimator_, search.best_params_, fold_scores
+
+    results = cross_validate(
+        pipeline, X_train, y_train, groups=groups, cv=cv, scoring=MACRO_F1_SCORER, error_score="raise"
+    )
+    fitted = clone(pipeline).fit(X_train, y_train)
+    return fitted, {}, [float(score) for score in results["test_score"]]
