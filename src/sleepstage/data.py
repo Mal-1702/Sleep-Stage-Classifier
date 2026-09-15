@@ -111,3 +111,97 @@ def trim_wake(
     start = max(0, sleep_positions[0] - margin)
     stop = min(len(df), sleep_positions[-1] + margin + 1)
     return df.iloc[start:stop].copy()
+
+
+# ---------------------------------------------------------------------------
+# Train/test splits
+# ---------------------------------------------------------------------------
+@dataclass
+class Split:
+    """Positional train/test indices plus the CV splitter to use on the training rows."""
+
+    split_type: str
+    train_idx: np.ndarray
+    test_idx: np.ndarray
+    cv: object
+    groups: np.ndarray | None = None
+    test_blocks: list[int] | None = None
+
+
+def random_split(stratify_labels, random_state: int = config.RANDOM_STATE) -> Split:
+    """Stratified random split of individual epochs (leaks between neighbouring epochs)."""
+    positions = np.arange(len(stratify_labels))
+    train_idx, test_idx = train_test_split(
+        positions, test_size=config.TEST_SIZE, random_state=random_state, stratify=stratify_labels
+    )
+    cv = StratifiedKFold(n_splits=config.CV_FOLDS, shuffle=True, random_state=random_state)
+    return Split("random", np.sort(train_idx), np.sort(test_idx), cv)
+
+
+def make_blocks(n_samples: int, n_blocks: int = config.N_BLOCKS) -> np.ndarray:
+    """Assign each time-ordered sample to one of `n_blocks` contiguous, near-equal blocks."""
+    if not 2 <= n_blocks <= n_samples:
+        raise ValueError(f"n_blocks must be between 2 and n_samples ({n_samples}), got {n_blocks}")
+    block_ids = np.empty(n_samples, dtype=int)
+    for block, positions in enumerate(np.array_split(np.arange(n_samples), n_blocks)):
+        block_ids[positions] = block
+    return block_ids
+
+
+def choose_test_blocks(block_ids: np.ndarray, labels, n_test_blocks: int = config.N_TEST_BLOCKS) -> list[int]:
+    """Pick the test blocks whose class mix best matches the whole recording.
+
+    First maximises the number of classes present in BOTH train and test, then minimises
+    the average gap between each class's test share and the overall test fraction, so no
+    class (e.g. deep sleep, which clusters early in the night) ends up almost entirely in
+    the test set. Deterministic: ties go to the lowest block numbers.
+    """
+    labels = np.asarray(labels)
+    classes, totals = np.unique(labels, return_counts=True)
+    n_blocks = int(block_ids.max()) + 1
+    target_share = n_test_blocks / n_blocks
+    best_score, best_combo = None, None
+    for combo in combinations(range(n_blocks), n_test_blocks):
+        test_labels = labels[np.isin(block_ids, combo)]
+        test_counts = np.array([np.sum(test_labels == cls) for cls in classes])
+        in_both = int(np.sum((test_counts > 0) & (test_counts < totals)))
+        share_gap = float(np.mean(np.abs(test_counts / totals - target_share)))
+        score = (in_both, -share_gap)
+        if best_score is None or score > best_score:
+            best_score, best_combo = score, combo
+    return list(best_combo)
+
+
+def blocked_split(
+    stratify_labels,
+    n_blocks: int = config.N_BLOCKS,
+    n_test_blocks: int = config.N_TEST_BLOCKS,
+    embargo: int = config.BLOCK_EMBARGO_EPOCHS,
+) -> Split:
+    """Hold out whole contiguous blocks of time as the test set.
+
+    Training epochs within `embargo` epochs of a test block are dropped, and CV on the
+    training rows uses StratifiedGroupKFold over block ids, so no block is split across folds.
+    """
+    n_samples = len(stratify_labels)
+    block_ids = make_blocks(n_samples, n_blocks)
+    test_blocks = choose_test_blocks(block_ids, stratify_labels, n_test_blocks)
+    is_test = np.isin(block_ids, test_blocks)
+
+    window = np.ones(2 * embargo + 1)
+    near_test = np.convolve(is_test.astype(float), window, mode="same") > 0
+    train_idx = np.flatnonzero(~near_test)
+    test_idx = np.flatnonzero(is_test)
+
+    groups = block_ids[train_idx]
+    n_splits = min(config.CV_FOLDS, len(np.unique(groups)))
+    cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=config.RANDOM_STATE)
+    return Split("blocked", train_idx, test_idx, cv, groups=groups, test_blocks=test_blocks)
+
+
+def make_split(split_type: str, stratify_labels, random_state: int = config.RANDOM_STATE) -> Split:
+    if split_type == "random":
+        return random_split(stratify_labels, random_state)
+    if split_type == "blocked":
+        return blocked_split(stratify_labels)
+    raise ValueError(f"Unknown split type: {split_type!r}")
